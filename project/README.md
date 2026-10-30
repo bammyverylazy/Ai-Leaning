@@ -184,8 +184,8 @@ Suggested as an option. Standard YOLO-pose gives **17 body keypoints only: no fi
 - Official splits are by **signer**.
 
 **Our subset**
-- 50 words chosen at random (fixed seed) from the words with enough examples in all splits (minimum 15 train, 3 val, 8 test).
-- Videos kept: train 775, val 177, test 589 (1,541 total). About 15 training videos per word.
+- 50 words with the most training examples from the words with enough examples in all splits (minimum 15 train, 3 val, 8 test).
+- Videos kept: train 950, val 191, test 729 (1,870 total). At least 18 training videos per word.
 - Test set contains 11 signers the model never saw during training.
 - Signer overlap between train/val/test is checked automatically and must be 0.
 
@@ -373,8 +373,8 @@ python src/download_model.py
 # 2. data (downloads only what we need)
 python src/fetch_subset.py list      # check connection / see file names
 python src/fetch_subset.py csv       # CSVs only
-python src/make_vocab.py --n 50      # choose 50 words
-python src/fetch_subset.py videos    # only those words' videos
+python src/make_vocab.py --n 50 --pick top  # choose 50 words with most training examples
+python src/fetch_subset.py videos    # only selected videos; already downloaded files are skipped
 
 # 3. landmarks
 $v = (Get-ChildItem data\raw\ASL_Citizen\videos -Filter *.mp4 | Select-Object -First 1).FullName

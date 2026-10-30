@@ -8,7 +8,7 @@
   data/subset_all.csv       รวมทุก split (มีคอลัมน์ split)
 
 ตัวอย่าง:
-  python src/make_vocab.py --n 50
+  python src/make_vocab.py --n 50 --pick top
 """
 import argparse
 import random
@@ -39,11 +39,16 @@ def load_split(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=50, help="จำนวนคำ")
+    ap.add_argument("--n", type=int, default=50, help="number of words to select")
     ap.add_argument("--min-train", type=int, default=15)
     ap.add_argument("--min-val", type=int, default=3)
     ap.add_argument("--min-test", type=int, default=8)
-    ap.add_argument("--pick", choices=["random", "top"], default="random")
+    ap.add_argument(
+        "--pick",
+        choices=["random", "top"],
+        default="top",
+        help="select words with the most training examples (top) or random words",
+    )
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -64,7 +69,7 @@ def main():
         print(f"WARNING: only {len(ok)} eligible, using all. Lower the --min-* values for more.")
         chosen = sorted(ok.index)
     elif args.pick == "top":
-        chosen = sorted(ok.sort_values("train", ascending=False).index[: args.n])
+        chosen = sorted(ok.sort_values("train", ascending=False, kind="stable").index[: args.n])
     else:
         chosen = sorted(random.Random(args.seed).sample(sorted(ok.index), args.n))
 

@@ -1,0 +1,161 @@
+{
+  "raw_metadata": {
+    "train": {
+      "rows": 40154,
+      "columns": [
+        "Participant ID",
+        "Video file",
+        "Gloss",
+        "ASL-LEX Code"
+      ],
+      "glosses": 2731,
+      "signers": 35
+    },
+    "val": {
+      "rows": 10304,
+      "columns": [
+        "Participant ID",
+        "Video file",
+        "Gloss",
+        "ASL-LEX Code"
+      ],
+      "glosses": 2731,
+      "signers": 6
+    },
+    "test": {
+      "rows": 32941,
+      "columns": [
+        "Participant ID",
+        "Video file",
+        "Gloss",
+        "ASL-LEX Code"
+      ],
+      "glosses": 2731,
+      "signers": 11
+    }
+  },
+  "subset": {
+    "vocab_size": 50,
+    "vocab": [
+      "ALLOFSUDDEN",
+      "BANDAGE",
+      "BLANKET",
+      "BOW1",
+      "CAMERA",
+      "CAN1",
+      "CANNON",
+      "CAPTURE",
+      "COMMENT",
+      "COMMITTEE",
+      "COOL2",
+      "EACH",
+      "ENGINEER",
+      "FLAG2",
+      "FOLLOW4",
+      "FOOTBALL",
+      "GIRL",
+      "GYM",
+      "HANDSOME2",
+      "HEAD",
+      "HOLY",
+      "INTUITIVE",
+      "JEALOUS",
+      "LIGHT",
+      "LUNCH1",
+      "MAPLE",
+      "MIX2",
+      "NAVY",
+      "NO",
+      "PARAGRAPH",
+      "PEACE",
+      "PET1",
+      "POOR",
+      "PRECIOUS",
+      "QTIP",
+      "RELEASE",
+      "ROOF",
+      "RUN1",
+      "SAUSAGE",
+      "SHOOT2",
+      "SLOW",
+      "SOCCER1",
+      "SOUP",
+      "STRAW",
+      "TIEUP2",
+      "UGLY",
+      "VOICE",
+      "WATCH",
+      "WRITEONWALL",
+      "YEAR"
+    ],
+    "splits": {
+      "train": {
+        "samples": 775,
+        "signers": 32,
+        "glosses": 50
+      },
+      "val": {
+        "samples": 177,
+        "signers": 5,
+        "glosses": 50
+      },
+      "test": {
+        "samples": 589,
+        "signers": 11,
+        "glosses": 50
+      }
+    }
+  },
+  "signer_leakage": {
+    "train/val_overlap": [],
+    "train/test_overlap": [],
+    "val/test_overlap": []
+  },
+  "class_distribution": {
+    "min": 15,
+    "max": 19,
+    "mean": 15.5,
+    "median": 15.0
+  },
+  "features": {
+    "train": {
+      "samples": 753,
+      "pos_shape": [
+        753,
+        64,
+        98,
+        3
+      ],
+      "classes": 50
+    },
+    "val": {
+      "samples": 167,
+      "pos_shape": [
+        167,
+        64,
+        98,
+        3
+      ],
+      "classes": 50
+    },
+    "test": {
+      "samples": 577,
+      "pos_shape": [
+        577,
+        64,
+        98,
+        3
+      ],
+      "classes": 50
+    }
+  },
+  "models": [
+    "gru_seed0.pt",
+    "gru_seed1.pt",
+    "gru_seed2.pt",
+    "lstm_seed0.pt",
+    "lstm_seed1.pt",
+    "lstm_seed2.pt"
+  ],
+  "elapsed_sec": 0.6
+}

@@ -1,0 +1,28 @@
+============================================================
+DATASET REPORT
+============================================================
+
+[Raw ASL Citizen metadata]
+  train: 40154 rows, 35 signers, 2731 glosses
+  val: 10304 rows, 6 signers, 2731 glosses
+  test: 32941 rows, 11 signers, 2731 glosses
+
+[Subset] vocab=50 words
+  train: 775 samples, 32 signers
+  val: 177 samples, 5 signers
+  test: 589 samples, 11 signers
+
+[Signer leakage]
+  train/val_overlap: OK 
+  train/test_overlap: OK 
+  val/test_overlap: OK 
+
+[Extracted features]
+  train: 753 samples, shape [753, 64, 98, 3]
+  val: 167 samples, shape [167, 64, 98, 3]
+  test: 577 samples, shape [577, 64, 98, 3]
+
+[Models]: ['gru_seed0.pt', 'gru_seed1.pt', 'gru_seed2.pt', 'lstm_seed0.pt', 'lstm_seed1.pt', 'lstm_seed2.pt']
+
+Time: 0.6s
+============================================================
