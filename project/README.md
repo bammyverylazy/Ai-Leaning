@@ -426,9 +426,12 @@ python src/train.py --kind lstm --seed 0
 
 # 5. desktop application
 python src\demo.py --ckpt models\gru_seed3.pt
+# Optional: print rolling camera, MediaPipe, model, UI, and speech timings
+python src\demo.py --ckpt models\gru_seed3.pt --debug-performance
 ```
 
 The application opens in Demo mode. Use its top-right selector to switch to Testing. Both `src\demo.py` and `src\realtime.py` launch this same interface.
+Demo mode keeps the webcam preview at its existing display size while capturing at 640×480, matching the landmark extraction scale used during training. Performance output is opt-in and appears in the console every five seconds.
 
 Download links:
 - Holistic Landmarker model: https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task

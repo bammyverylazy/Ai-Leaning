@@ -82,6 +82,7 @@ class ApplicationArgumentsTests(unittest.TestCase):
             parser.parse_args(["--mode", "testing", "--target", "AXE1"]).target,
             "AXE1",
         )
+        self.assertTrue(parser.parse_args(["--debug-performance"]).debug_performance)
 
 
 if __name__ == "__main__":

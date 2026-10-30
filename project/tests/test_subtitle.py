@@ -53,6 +53,42 @@ class SubtitleManagerTests(unittest.TestCase):
         self.assertEqual(self.manager.state, State.IDLE)
         self.assertEqual(self.manager.entries, [])
 
+    def test_strong_consistent_prediction_uses_fast_confirmation(self):
+        manager = SubtitleManager(min_votes=5, conf_threshold=0.45)
+
+        self.assertIsNone(manager.update("HELLO", 0.96, True)[0])
+        self.assertIsNone(manager.update("HELLO", 0.95, True)[0])
+        confirmed, state = manager.update("HELLO", 0.94, True)
+
+        self.assertEqual(confirmed, "HELLO")
+        self.assertEqual(state, State.COOLDOWN)
+
+    def test_normal_confidence_still_requires_full_stabilization(self):
+        manager = SubtitleManager(min_votes=5, conf_threshold=0.45)
+
+        for _ in range(4):
+            confirmed, _ = manager.update("HELLO", 0.70, True)
+            self.assertIsNone(confirmed)
+        confirmed, _ = manager.update("HELLO", 0.70, True)
+
+        self.assertEqual(confirmed, "HELLO")
+
+    def test_unstable_high_confidence_prediction_does_not_fast_commit(self):
+        manager = SubtitleManager(min_votes=5, conf_threshold=0.45)
+        predictions = [
+            ("HELLO", 0.96),
+            ("THANK YOU", 0.95),
+            ("HELLO", 0.94),
+        ]
+
+        results = [
+            manager.update(label, confidence, True)[0]
+            for label, confidence in predictions
+        ]
+
+        self.assertEqual(results, [None, None, None])
+        self.assertEqual(manager.subtitle, "")
+
 
 if __name__ == "__main__":
     unittest.main()

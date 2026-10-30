@@ -37,6 +37,8 @@ class SubtitleManager:
     min_votes: int = 5           # ต้องเห็นคำเดียวกันอย่างน้อยกี่ครั้งต่อเนื่อง จึง CONFIRM
     vote_window: int = 10        # ขนาด sliding window สำหรับนับ votes
     conf_threshold: float = 0.45 # confidence ต่ำกว่านี้ = ไม่นับ
+    fast_conf_threshold: float = 0.90
+    fast_min_votes: int = 3
     cooldown_sec: float = 0.8    # minimum time before the subtitle manager can re-arm
     idle_frames: int = 8         # consecutive invalid updates required to re-arm
     max_subtitle_words: int = 50 # จำกัดความยาว subtitle
@@ -110,6 +112,14 @@ class SubtitleManager:
             counter[w] = counter.get(w, 0) + 1
         best_word = max(counter, key=lambda k: counter[k])
         best_count = counter[best_word]
+        best_confidences = [confidence for vote_word, confidence in self._votes
+                            if vote_word == best_word]
+        fast_confirmation = (
+            best_count >= self.fast_min_votes
+            and all(confidence >= self.fast_conf_threshold
+                    for confidence in best_confidences)
+        )
+        required_votes = self.fast_min_votes if fast_confirmation else self.min_votes
 
         # ---- IDLE / CANDIDATE ----
         if self._state == State.IDLE:
@@ -122,7 +132,7 @@ class SubtitleManager:
                 self._votes.clear()
                 self._votes.append((word, conf))
                 self._state = State.IDLE
-            elif best_count >= self.min_votes:
+            elif best_count >= required_votes:
                 # ยืนยัน!
                 avg_conf = sum(c for w, c in self._votes if w == best_word) / best_count
                 self._confirmed_word = best_word

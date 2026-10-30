@@ -17,13 +17,18 @@ class SpeechServiceTests(unittest.TestCase):
     def test_speaks_only_enqueued_committed_labels_and_respects_mute(self):
         spoken = []
         spoken_event = threading.Event()
+        started = []
 
         def fake_speaker(text, cancelled):
             if not cancelled.is_set():
                 spoken.append(text)
                 spoken_event.set()
 
-        service = SpeechService(lambda _error: None, speaker=fake_speaker)
+        service = SpeechService(
+            lambda _error: None,
+            speaker=fake_speaker,
+            on_started=lambda text, timestamp: started.append((text, timestamp)),
+        )
         try:
             service.set_enabled(False)
             self.assertFalse(service.enqueue("HELLO"))
@@ -34,6 +39,8 @@ class SpeechServiceTests(unittest.TestCase):
             time.sleep(0.05)
 
             self.assertEqual(spoken, ["Thank You"])
+            self.assertEqual([text for text, _ in started], ["Thank You"])
+            self.assertGreater(started[0][1], 0)
         finally:
             service.close()
 

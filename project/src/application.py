@@ -9,6 +9,7 @@ import queue
 import threading
 import time
 import uuid
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,7 @@ from extract import make_landmarker, result_to_array
 from label_display import CanonicalPrediction, aggregate_predictions, canonical_label
 from model import SeqClassifier
 from sign_demo_catalog import SignDemo, load_catalog, write_missing_report
-from speech import SpeechService
+from speech import SpeechService, spoken_text
 from subtitle import State, SubtitleManager
 
 
@@ -175,6 +176,103 @@ def draw_landmark_overlay(frame: np.ndarray, landmarks: np.ndarray) -> None:
                 )
 
 
+class PerformanceMonitor:
+    """Keep bounded timing samples and report only when debug mode is enabled."""
+
+    def __init__(self) -> None:
+        self._samples: dict[str, collections.deque[float]] = {}
+        self._lock = threading.Lock()
+
+    def add(self, stage: str, milliseconds: float) -> None:
+        with self._lock:
+            samples = self._samples.setdefault(stage, collections.deque(maxlen=240))
+            samples.append(milliseconds)
+
+    def mean(self, stage: str) -> float:
+        with self._lock:
+            samples = self._samples.get(stage)
+            return statistics.fmean(samples) if samples else 0.0
+
+    def report(self) -> str:
+        with self._lock:
+            snapshot = {name: list(samples) for name, samples in self._samples.items()}
+        parts = []
+        for stage, values in snapshot.items():
+            if not values:
+                continue
+            parts.append(
+                f"{stage} avg={statistics.fmean(values):.1f}ms "
+                f"p95={float(np.percentile(values, 95)):.1f}ms n={len(values)}"
+            )
+        return " | ".join(parts)
+
+
+class CameraCapture(threading.Thread):
+    """Read webcam frames independently and retain only the freshest unprocessed frame."""
+
+    def __init__(
+        self,
+        camera_index: int,
+        frames: queue.Queue[tuple[np.ndarray, float]],
+        stop_event: threading.Event,
+        events: queue.Queue[tuple[str, Any]],
+        performance: PerformanceMonitor,
+        mode: str,
+    ) -> None:
+        super().__init__(name="asl-camera-capture", daemon=True)
+        self.camera_index = camera_index
+        self.frames = frames
+        self.stop_event = stop_event
+        self.events = events
+        self.performance = performance
+        self.mode = mode
+        self.dropped_frames = 0
+
+    def run(self) -> None:
+        camera: cv2.VideoCapture | None = None
+        try:
+            camera = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+            if not camera.isOpened():
+                camera.release()
+                camera = cv2.VideoCapture(self.camera_index)
+            if not camera.isOpened():
+                raise RuntimeError(
+                    f"Could not open camera {self.camera_index}; try another camera index."
+                )
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            camera.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1000)
+            self.events.put(("camera_ready", self.mode))
+
+            while not self.stop_event.is_set():
+                started = time.perf_counter()
+                ok, frame = camera.read()
+                ended = time.perf_counter()
+                self.performance.add("camera_read", (ended - started) * 1000)
+                if not ok:
+                    if not self.stop_event.is_set():
+                        raise RuntimeError("The webcam stopped returning frames.")
+                    break
+                packet = (frame, ended)
+                try:
+                    self.frames.put_nowait(packet)
+                except queue.Full:
+                    try:
+                        self.frames.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        self.dropped_frames += 1
+                    self.frames.put_nowait(packet)
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                self.events.put(("worker_error", str(exc)))
+                self.stop_event.set()
+        finally:
+            if camera is not None:
+                camera.release()
+
+
 class VideoPanel(ttk.Frame):
     def __init__(self, master: tk.Misc, *, height: int = 400) -> None:
         super().__init__(master, style="Preview.TFrame")
@@ -254,10 +352,25 @@ class RecognitionWorker(threading.Thread):
         self.show_landmarks = True
         self._display_predictions: list[CanonicalPrediction] = []
         self._hands_present = False
-        self._latest_commit: tuple[str, float] | None = None
+        self._latest_commit: tuple[int, str, float, float] | None = None
+        self.performance = PerformanceMonitor()
         self._fps_samples: collections.deque[float] = collections.deque(maxlen=30)
-        self._landmark_samples: collections.deque[float] = collections.deque(maxlen=60)
-        self._classifier_samples: collections.deque[float] = collections.deque(maxlen=60)
+        self._commit_sequence = 0
+        self._last_rendered_commit = 0
+        self._candidate_label = ""
+        self._candidate_started_at: float | None = None
+        self._prediction_interval = 2
+        self._frames: queue.Queue[tuple[np.ndarray, float]] = queue.Queue(
+            maxsize=1
+        )
+        self.capture = CameraCapture(
+            camera_index,
+            self._frames,
+            self._stop_event,
+            self.events,
+            self.performance,
+            mode,
+        )
 
     @property
     def recording(self) -> bool:
@@ -274,6 +387,11 @@ class RecognitionWorker(threading.Thread):
 
     def stop(self) -> None:
         self._stop_event.set()
+        self.capture.stop_event.set()
+
+    @property
+    def commit_info(self) -> tuple[int, str, float, float] | None:
+        return self._latest_commit
 
     def latest_frame(self, after_version: int) -> tuple[int, np.ndarray | None]:
         with self._frame_lock:
@@ -282,50 +400,65 @@ class RecognitionWorker(threading.Thread):
             return self._frame_version, self._latest_frame
 
     def run(self) -> None:
-        camera: cv2.VideoCapture | None = None
         try:
-            camera = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
-            if not camera.isOpened():
-                camera.release()
-                camera = cv2.VideoCapture(self.camera_index)
-            if not camera.isOpened():
-                raise RuntimeError(
-                    f"Could not open camera {self.camera_index}; try another camera index."
-                )
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            camera.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 1000)
-            self.events.put(("camera_ready", self.mode))
-
             recording_frames: list[np.ndarray] = []
             frame_buffer: collections.deque[np.ndarray] = collections.deque(
                 maxlen=C.SEQ_LEN
             )
             frame_count = 0
             started_at = time.perf_counter()
-            previous_frame_at = started_at
             last_timestamp = -1
+            previous_processed_at: float | None = None
+            self.capture.start()
             with make_landmarker() as landmarker:
                 while not self._stop_event.is_set():
                     self._process_commands(recording_frames)
                     if self._stop_event.is_set():
                         break
-                    ok, raw_frame = camera.read()
-                    if not ok:
-                        raise RuntimeError("The webcam stopped returning frames.")
+                    try:
+                        raw_frame, captured_at = self._frames.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    frame_started = time.perf_counter()
                     frame_count += 1
-                    display_frame = cv2.flip(raw_frame, 1)
-                    now = time.perf_counter()
-                    self._fps_samples.append(1.0 / max(now - previous_frame_at, 1e-6))
-                    previous_frame_at = now
+                    source_height, source_width = raw_frame.shape[:2]
+                    scale = min(1280 / source_width, 720 / source_height)
+                    display_width = max(1, round(source_width * scale))
+                    display_height = max(1, round(source_height * scale))
+                    offset_x = (1280 - display_width) // 2
+                    offset_y = (720 - display_height) // 2
+                    display_source = cv2.resize(
+                        raw_frame,
+                        (display_width, display_height),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+                    display_frame = np.zeros((720, 1280, 3), dtype=raw_frame.dtype)
+                    display_frame[
+                        offset_y : offset_y + display_height,
+                        offset_x : offset_x + display_width,
+                    ] = cv2.flip(display_source, 1)
+                    if previous_processed_at is not None:
+                        self._fps_samples.append(
+                            1.0 / max(frame_started - previous_processed_at, 1e-6)
+                        )
+                    previous_processed_at = frame_started
+                    self.performance.add(
+                        "captured_frame_age",
+                        max(0.0, (frame_started - captured_at) * 1000),
+                    )
 
                     if self.mode == "demo":
+                        stage_started = time.perf_counter()
                         rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
                         image = mp.Image(
                             image_format=mp.ImageFormat.SRGB,
                             data=np.ascontiguousarray(rgb),
                         )
-                        now = time.perf_counter()
+                        self.performance.add(
+                            "frame_to_mp_image",
+                            (time.perf_counter() - stage_started) * 1000,
+                        )
+                        now = captured_at
                         timestamp_ms = max(
                             last_timestamp + 1,
                             int((now - started_at) * 1000),
@@ -335,22 +468,29 @@ class RecognitionWorker(threading.Thread):
                         landmarks = result_to_array(
                             landmarker.detect_for_video(image, timestamp_ms)
                         )
-                        self._landmark_samples.append(
-                            (time.perf_counter() - landmark_started) * 1000
+                        self.performance.add(
+                            "mediapipe",
+                            (time.perf_counter() - landmark_started) * 1000,
                         )
                         frame_buffer.append(landmarks)
-                        if frame_count % 3 == 0:
+                        if frame_count % self._prediction_interval == 0:
                             self._recognize_live(frame_buffer, landmarks)
                         display_landmarks = landmarks.copy()
-                        display_landmarks[:, 0] = 1.0 - display_landmarks[:, 0]
+                        display_landmarks[:, 0] = (
+                            offset_x + display_width * (1.0 - display_landmarks[:, 0])
+                        ) / 1280
+                        display_landmarks[:, 1] = (
+                            offset_y + display_height * display_landmarks[:, 1]
+                        ) / 720
                         self._draw_demo_overlay(
                             display_frame,
                             display_landmarks,
-                            float(np.mean(self._fps_samples)),
-                            float(np.mean(self._landmark_samples)),
-                            float(np.mean(self._classifier_samples))
-                            if self._classifier_samples
-                            else 0.0,
+                            (
+                                float(np.mean(self._fps_samples))
+                                if self._fps_samples else 0.0
+                            ),
+                            self.performance.mean("mediapipe"),
+                            self.performance.mean("model_inference"),
                         )
                     elif self.recording:
                         rgb = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2RGB)
@@ -371,13 +511,18 @@ class RecognitionWorker(threading.Thread):
                         )
                         self.events.put(("recording_progress", len(recording_frames)))
                     self._publish_frame(display_frame)
+                    self.performance.add(
+                        "frame_processing",
+                        (time.perf_counter() - frame_started) * 1000,
+                    )
         except Exception as exc:
             self.events.put(("worker_error", str(exc)))
         finally:
+            self._stop_event.set()
+            if self.capture.is_alive():
+                self.capture.join()
             with self._recording_lock:
                 self._recording = False
-            if camera is not None:
-                camera.release()
             self.events.put(("worker_stopped", self.mode))
 
     def _publish_frame(self, frame: np.ndarray) -> None:
@@ -425,18 +570,37 @@ class RecognitionWorker(threading.Thread):
         self._hands_present = hands_present
         predictions: list[CanonicalPrediction] = []
         if len(frame_buffer) == C.SEQ_LEN:
-            classifier_started = time.perf_counter()
+            preprocess_started = time.perf_counter()
             positions, present = preprocess_sequence(np.stack(frame_buffer))
             features = torch.from_numpy(build_features(positions, present))[None]
+            self.performance.add(
+                "sequence_preprocessing",
+                (time.perf_counter() - preprocess_started) * 1000,
+            )
+            classifier_started = time.perf_counter()
             with torch.no_grad():
                 probabilities = torch.softmax(self.model(features), dim=1)[0]
             predictions = aggregate_predictions(probabilities, self.vocab, top_k=3)
-            self._classifier_samples.append(
-                (time.perf_counter() - classifier_started) * 1000
+            self.performance.add(
+                "model_inference",
+                (time.perf_counter() - classifier_started) * 1000,
             )
         self._display_predictions = predictions
         if predictions:
             best = predictions[0]
+            now = time.perf_counter()
+            if (
+                hands_present
+                and self.subtitle_manager.state in (State.IDLE, State.CANDIDATE)
+                and best.confidence >= self.subtitle_manager.conf_threshold
+            ):
+                if self._candidate_label != best.canonical_label:
+                    self._candidate_label = best.canonical_label
+                    self._candidate_started_at = now
+            else:
+                self._candidate_label = ""
+                self._candidate_started_at = None
+            stabilization_started = time.perf_counter()
             newly_committed, _ = self.subtitle_manager.update(
                 best.canonical_label,
                 best.confidence,
@@ -444,16 +608,45 @@ class RecognitionWorker(threading.Thread):
                 original_model_label=best.original_model_label,
                 class_index=best.class_index,
             )
+            self.performance.add(
+                "stabilization",
+                (time.perf_counter() - stabilization_started) * 1000,
+            )
             self.events.put(("prediction", (predictions, hands_present)))
             if newly_committed is not None:
                 with self._commit_lock:
                     self._commit_sequence += 1
                     sequence = self._commit_sequence
-                self._latest_commit = (newly_committed, time.perf_counter())
+                committed_at = time.perf_counter()
+                candidate_started_at = self._candidate_started_at or committed_at
+                self._latest_commit = (
+                    sequence,
+                    newly_committed,
+                    candidate_started_at,
+                    committed_at,
+                )
+                if self._candidate_started_at is not None:
+                    self.performance.add(
+                        "candidate_to_commit",
+                        (committed_at - self._candidate_started_at) * 1000,
+                    )
+                self.performance.add(
+                    "confirmation_to_subtitle_update",
+                    (time.perf_counter() - committed_at) * 1000,
+                )
+                self._candidate_label = ""
+                self._candidate_started_at = None
                 self.events.put(("committed", (sequence, newly_committed)))
                 self.events.put(("subtitle", self.subtitle_manager.subtitle))
         else:
+            self._candidate_label = ""
+            self._candidate_started_at = None
+            stabilization_started = time.perf_counter()
             self.subtitle_manager.update(None, 0.0, hands_present)
+            self.performance.add(
+                "stabilization",
+                (time.perf_counter() - stabilization_started) * 1000,
+            )
             self.events.put(("prediction", ([], hands_present)))
 
     def _draw_demo_overlay(
@@ -562,7 +755,7 @@ class RecognitionWorker(threading.Thread):
             1,
         )
 
-        if self._latest_commit and time.perf_counter() - self._latest_commit[1] < 0.5:
+        if self._latest_commit and time.perf_counter() - self._latest_commit[3] < 0.5:
             overlay = frame.copy()
             cv2.rectangle(overlay, (0, 0), (width, height), GREEN, -1)
             cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, frame)
@@ -668,9 +861,20 @@ class ASLApplication:
         self._demo_watched = False
         self._demo_watch_duration = 0.0
         self._selected_label = ""
+        self._ui_performance = PerformanceMonitor()
+        self._speech_commit_times: dict[str, collections.deque[float]] = (
+            collections.defaultdict(collections.deque)
+        )
+        self._last_performance_report = time.perf_counter()
 
         self.speech = SpeechService(
-            lambda error: self.events.put(("speech_error", error))
+            lambda error: self.events.put(("speech_error", error)),
+            on_started=lambda text, started_at: self.events.put(
+                ("speech_started", (text, started_at))
+            ),
+            on_ready=lambda duration: self.events.put(
+                ("speech_engine_ready", duration)
+            ),
         )
         self._configure_style()
         self._build_interface()
@@ -688,6 +892,7 @@ class ASLApplication:
     def _load_model(checkpoint_path: Path) -> tuple[SeqClassifier, list[str]]:
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
+        torch.set_num_threads(min(2, torch.get_num_threads()))
         checkpoint = torch.load(
             checkpoint_path, map_location="cpu", weights_only=False
         )
@@ -1139,6 +1344,7 @@ class ASLApplication:
             self.mode_switch_button.place_configure(y=6)
             self.sound_button.place_configure(y=6)
         self.speech.cancel_pending()
+        self._speech_commit_times.clear()
         if mode == "testing" and self._selected_label:
             self._load_target_video()
         if mode == "testing":
@@ -1181,6 +1387,7 @@ class ASLApplication:
             self._transitioning = True
             self._pending_mode = mode
             self.speech.cancel_pending()
+            self._speech_commit_times.clear()
             self._stop_demo_video()
             self.worker.stop()
             self.status_var.set("Closing the camera before switching modes…")
@@ -1292,6 +1499,7 @@ class ASLApplication:
 
     def _clear_subtitle(self) -> None:
         self.speech.cancel_pending()
+        self._speech_commit_times.clear()
         if self.worker is not None and self.worker.mode == "demo":
             self._ignore_commits_until_clear_ack = True
             self.worker.command("clear_subtitle")
@@ -1304,6 +1512,8 @@ class ASLApplication:
         self._sound_enabled.set(not self._sound_enabled.get())
         enabled = self._sound_enabled.get()
         self.speech.set_enabled(enabled)
+        if not enabled:
+            self._speech_commit_times.clear()
         self.sound_button.configure(text=f"Sound: {'ON' if enabled else 'OFF'}")
         self.status_var.set(
             "Speech enabled · only newly committed signs are spoken."
@@ -1330,6 +1540,18 @@ class ASLApplication:
                     else self.test_preview
                 )
                 preview.show_frame(frame)
+                commit = self.worker.commit_info
+                if commit is not None and commit[0] > self.worker._last_rendered_commit:
+                    now = time.perf_counter()
+                    self._ui_performance.add(
+                        "commit_to_ui_preview",
+                        (now - commit[3]) * 1000,
+                    )
+                    self._ui_performance.add(
+                        "prediction_to_subtitle_preview",
+                        (now - commit[2]) * 1000,
+                    )
+                    self.worker._last_rendered_commit = commit[0]
             if not self.worker.is_alive():
                 stopped_mode = self.worker.mode
                 self.worker = None
@@ -1356,6 +1578,21 @@ class ASLApplication:
                     text="Finish attempt", state="normal"
                 )
                 self.test_camera_status.configure(text="Recording")
+        if self.args.debug_performance:
+            now = time.perf_counter()
+            if now - self._last_performance_report >= 5.0:
+                details = (
+                    self.worker.performance.report()
+                    if self.worker is not None
+                    else "camera worker stopped"
+                )
+                ui_details = self._ui_performance.report()
+                print(
+                    f"[performance] {details}"
+                    + (f" | UI/TTS {ui_details}" if ui_details else ""),
+                    flush=True,
+                )
+                self._last_performance_report = now
         self.root.after(30, self._poll)
 
     def _drain_events(self) -> None:
@@ -1384,8 +1621,10 @@ class ASLApplication:
                 ):
                     self.events.task_done()
                     continue
-                if self._sound_enabled.get():
-                    self.speech.enqueue(label)
+                key = spoken_text(label)
+                self._speech_commit_times[key].append(time.perf_counter())
+                if not self._sound_enabled.get() or not self.speech.enqueue(label):
+                    self._speech_commit_times[key].pop()
             elif event == "subtitle_cleared":
                 self._commit_floor = max(self._commit_floor, value)
                 self._ignore_commits_until_clear_ack = False
@@ -1431,10 +1670,24 @@ class ASLApplication:
                 if self.worker is not None and self.worker.mode == "testing":
                     self.test_camera_status.configure(text="Camera unavailable")
                     self.test_result.configure(text=value)
+            elif event == "speech_engine_ready":
+                self._ui_performance.add("speech_engine_startup", value)
             elif event == "speech_error":
+                self._speech_commit_times.clear()
                 self.status_var.set(
                     f"Speech unavailable; recognition continues. {value}"
                 )
+            elif event == "speech_started":
+                text, started_at = value
+                pending = self._speech_commit_times.get(text)
+                if pending:
+                    committed_at = pending.popleft()
+                    self._ui_performance.add(
+                        "commit_to_speech_start",
+                        (started_at - committed_at) * 1000,
+                    )
+                    if not pending:
+                        self._speech_commit_times.pop(text, None)
             elif event == "worker_stopped":
                 if value == "demo":
                     self.demo_preview.show_placeholder(
@@ -1467,6 +1720,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target", default="", help="initial testing target label")
     parser.add_argument("--min-votes", type=int, default=5)
     parser.add_argument("--cooldown", type=float, default=0.8)
+    parser.add_argument(
+        "--debug-performance",
+        action="store_true",
+        help="print rolling pipeline timing metrics every five seconds",
+    )
     parser.add_argument("--demo-manifest", default=str(C.SIGN_DEMO_MANIFEST))
     parser.add_argument("--attempt-db", default=str(C.RECOGNITION_ATTEMPTS_DB))
     return parser
