@@ -1,8 +1,8 @@
 """realtime.py — Real-time ASL word-by-word subtitle (ไม่ต้องกด SPACE)
 
 วิธีใช้:
-  python src/realtime.py --ckpt models/gru_seed0.pt
-  python src/realtime.py --ckpt models/gru_seed0.pt --thr 0.45 --camera 0 --no-landmarks
+  python src/realtime.py --ckpt models/gru_seed3.pt
+  python src/realtime.py --ckpt models/gru_seed3.pt --thr 0.45 --camera 0 --no-landmarks
 
 ปุ่ม:
   C = clear subtitle
@@ -22,7 +22,7 @@ from __future__ import annotations
 import argparse
 import collections
 import time
-from typing import Deque, List, Optional
+from typing import Deque, List
 
 import cv2
 import mediapipe as mp
@@ -32,6 +32,7 @@ import torch
 import config as C
 from dataset import build_features, preprocess_sequence
 from extract import make_landmarker, result_to_array
+from label_display import aggregate_predictions
 from model import SeqClassifier
 from subtitle import State, SubtitleManager
 
@@ -170,7 +171,9 @@ def run(args):
     # current prediction display
     cur_word = ""
     cur_conf = 0.0
-    cur_top3: List[tuple] = []
+    cur_original = ""
+    cur_class_index = -1
+    cur_top3 = []
     frame_count = 0
     t_begin = time.time()
     last_ts = -1
@@ -220,13 +223,21 @@ def run(args):
                 with torch.no_grad():
                     prob = torch.softmax(model(x), 1)[0]
                 lat_cls.append((time.time() - t1) * 1000)
-                top_p, top_i = prob.topk(min(3, n_classes))
-                cur_top3 = [(vocab[i], float(p)) for p, i in zip(top_p, top_i)]
-                cur_word = cur_top3[0][0]
-                cur_conf = cur_top3[0][1]
+                cur_top3 = aggregate_predictions(prob, vocab, top_k=3)
+                best = cur_top3[0]
+                cur_word = best.canonical_label
+                cur_conf = best.confidence
+                cur_original = best.original_model_label
+                cur_class_index = best.class_index
 
                 # ส่งเข้า state machine
-                newly_confirmed, _ = sub_mgr.update(cur_word, cur_conf, hands_present)
+                newly_confirmed, _ = sub_mgr.update(
+                    cur_word,
+                    cur_conf,
+                    hands_present,
+                    original_model_label=cur_original,
+                    class_index=cur_class_index,
+                )
             elif not hands_present:
                 sub_mgr.update(None, 0.0, False)
 
@@ -258,12 +269,18 @@ def run(args):
             if not hands_present:
                 draw_text(display_frame, "No hands detected", (10, panel_y + 28), 0.7, ORANGE)
             elif cur_top3:
-                w0, c0 = cur_top3[0]
-                col = GREEN if c0 >= args.thr else ORANGE
-                draw_text(display_frame, f"{w0}  {c0*100:.0f}%", (10, panel_y + 28), 0.9, col)
+                best_prediction = cur_top3[0]
+                col = GREEN if best_prediction.confidence >= args.thr else ORANGE
+                draw_text(
+                    display_frame,
+                    f"{best_prediction.canonical_label}  {best_prediction.confidence*100:.0f}%",
+                    (10, panel_y + 28),
+                    0.9,
+                    col,
+                )
                 # top 2–3
-                for k, (wk, ck_) in enumerate(cur_top3[1:], 1):
-                    draw_text(display_frame, f"  {k+1}. {wk} {ck_*100:.0f}%",
+                for k, prediction in enumerate(cur_top3[1:], 1):
+                    draw_text(display_frame, f"  {k+1}. {prediction.canonical_label} {prediction.confidence*100:.0f}%",
                               (10, panel_y + 28 + 26 * k), 0.55, GRAY)
 
             # --- Candidate progress bar ---
@@ -312,6 +329,10 @@ def run(args):
     print("\n--- Session Summary ---")
     print("Subtitle:", sub_mgr.subtitle)
     print("Words:", sub_mgr.word_list)
+    print(
+        "Original model labels:",
+        [(entry.class_index, entry.original_model_label) for entry in sub_mgr.entries],
+    )
     if lat_lm:
         print(f"Landmark latency: mean {np.mean(lat_lm):.1f} ms, p95 {np.percentile(list(lat_lm), 95):.1f} ms")
     if lat_cls:
@@ -319,21 +340,9 @@ def run(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Real-time ASL word-by-word subtitle")
-    ap.add_argument("--ckpt", default=str(C.MODELS / "gru_seed0.pt"),
-                    help="path to model checkpoint (.pt)")
-    ap.add_argument("--thr", type=float, default=0.45,
-                    help="confidence threshold (ต่ำกว่านี้ = ไม่แน่ใจ)")
-    ap.add_argument("--camera", type=int, default=0,
-                    help="webcam index")
-    ap.add_argument("--min-votes", type=int, default=5,
-                    help="จำนวนเฟรมที่ต้องเห็นคำเดิมก่อน confirm")
-    ap.add_argument("--cooldown", type=float, default=0.8,
-                    help="วินาทีที่รอหลัง confirm ก่อนรับคำใหม่")
-    ap.add_argument("--no-landmarks", action="store_true",
-                    help="ซ่อน landmark overlay")
-    args = ap.parse_args()
-    run(args)
+    from application import main as launch_application
+
+    launch_application()
 
 
 if __name__ == "__main__":

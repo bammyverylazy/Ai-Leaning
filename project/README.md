@@ -17,7 +17,7 @@ An educational prototype that watches a short video (or webcam clip) of one Amer
 7. [The classifier in detail](#7-the-classifier-in-detail)
 8. [Training and evaluation](#8-training-and-evaluation)
 9. [The "not sure" mechanism](#9-the-not-sure-mechanism)
-10. [Webcam demo](#10-webcam-demo)
+10. [Unified desktop application](#10-unified-desktop-application)
 11. [Glossary of technical terms](#11-glossary-of-technical-terms)
 12. [How to run everything (Windows)](#12-how-to-run-everything-windows)
 13. [Project structure](#13-project-structure)
@@ -206,7 +206,8 @@ If the same person appears in training and test, the model can memorize *that pe
 | `dataset.py` | Cleans, normalizes, resamples, builds features, defines augmentation and the PyTorch `Dataset` | Turns raw points into learnable input |
 | `model.py` | Defines the BiGRU/BiLSTM classifier | Stage 2 |
 | `train.py` | Trains, picks best epoch on validation, evaluates on test, writes reports | Honest evaluation |
-| `demo.py` | Webcam recording → prediction → display, with latency and FPS | Live prototype |
+| `application.py`, `demo.py` | Unified Demo/Testing desktop interface and camera workflow | User-facing application |
+| `speech.py` | Asynchronous offline Windows SAPI speech for committed subtitle entries | Speech feedback |
 
 ### The 98 selected points (`config.py`)
 - **Pose: 13** (nose, eyes, ears, mouth corners, shoulders, elbows, wrists)
@@ -288,15 +289,51 @@ Softmax confidence is only a rough signal and can still be wrong on unusual inpu
 
 ---
 
-## 10. Webcam demo
+## 10. Unified desktop application
 
-- Press **SPACE** to start recording a sign, **SPACE** again to stop and predict, **Q** to quit.
-- Landmarks are extracted live, buffered, then processed with exactly the same `preprocess_sequence` and `build_features` as in training. Using identical preprocessing is essential.
-- The screen shows FPS, landmark latency, top-3 predictions with percentages, and "no hands detected" warnings.
-- The image sent to the model is **not mirrored** (only the display is), to match the training data orientation.
-- On exit it prints mean and p95 landmark latency and mean classifier latency.
+Run the app from the `project` folder. The main window has a top-right mode selector for **Demo** (free practice) and **Testing** (guided attempts). The camera preview is embedded in the application, and only one webcam/recognition worker can run at a time.
 
-Things to test and record: bright vs dim light, plain vs busy background, camera height and distance, hands partly out of frame, several different people.
+```powershell
+python src\demo.py --ckpt models\gru_seed3.pt
+python src\demo.py --mode testing --ckpt models\gru_seed3.pt
+```
+
+In Demo mode, choose **Start camera** to see a live preview and continuous sign recognition. Stabilized signs are added to the subtitle; **Clear** clears the current subtitle, and the sound toggle only affects speech. `Ctrl+L` also clears the subtitle. The image shown is mirrored for the user, while the unmirrored camera frame is used for recognition to preserve training orientation.
+
+Speech uses the computer's installed Windows **System.Speech/SAPI** English voice locally and works without an internet connection. Only a newly stabilized sign that has been added to the subtitle is queued for speech. Words are spoken one at a time in a background worker; muting, clearing the subtitle, switching modes, or closing the app cancels queued speech. If PowerShell or an enabled English voice is unavailable, the app reports the problem and continues recognition and subtitles without speech.
+
+### Guided testing
+
+Testing mode is a page in the same application. Choose a verified target, replay its embedded reference video as needed, then select **Start attempt**. The webcam opens in the adjacent preview and the attempt starts explicitly; finish it to display the prediction and confidence and save its metadata. Attempts remain unverified until an independent reviewer records ground truth. If a target is changed while a camera is active, stop that camera first; switching away during an active test asks before discarding the unfinished attempt.
+
+Demonstrations are intentionally managed separately from the ASL Citizen training videos:
+
+- Add reviewed MP4/H.264 files under `data/sign_demos/videos/<LABEL>/`.
+- Fill that label's placeholder row in `data/sign_demos/manifest.csv` with the exact checkpoint label, a unique `video_id`, a version, the MP4 `filename`, its `source`, `verification_status=verified`, the independently checked `verified_meaning`, reviewer `notes`, and `is_current=true`.
+- Keep old versioned files and rows when replacing a video: mark the previous row `is_current=false` and add a new current row. Use a clear frontal view with the hands and relevant upper body visible. Use MP4/H.264; the file must be decodable by the installed OpenCV build.
+- The runtime checks that a video opens and contains readable frames. The runtime will not treat raw training clips as demonstrations. Missing, unverified, or corrupted videos are listed in `reports/missing_sign_demos.csv`, and cannot be assigned as a test target. In the app, use **Open missing-demo list** to inspect labels still awaiting clips.
+
+At present, **none of the 50 labels has a curated, verified demonstration video**. ASL Citizen clips exist as labeled training examples, but have not been reviewed as teaching references. The full missing-label list is in `reports/missing_sign_demos.csv`.
+
+Start the app in guided testing mode, or select Testing from Demo mode:
+
+```powershell
+python src\demo.py --mode testing --ckpt models\gru_seed3.pt
+python src\demo.py --mode testing --ckpt models\gru_seed3.pt --target AXE1
+```
+
+`--target` selects an initial label only when that label has a verified, readable demonstration video. If no verified demos are available, Testing mode explains why and links to the missing-demo report; Demo mode remains available for webcam practice.
+
+Each completed webcam attempt is stored in `data/recognition_attempts.sqlite3`. Target, canonical prediction, original checkpoint label/class index, top-3 scores, model SHA-256, preprocessing version, inference latency, demo watched duration, session ID, and timestamp are recorded separately. Ground truth remains empty and correctness remains `unverified` until an independent reviewer supplies it. Existing databases are migrated without deleting prior attempts:
+
+```powershell
+python src\manage_attempts.py pending
+python src\manage_attempts.py verify --attempt-id 1 --ground-truth AXE1 --verified-by reviewer_id
+python src\manage_attempts.py correct --attempt-id 1 --ground-truth DOG1 --verified-by reviewer_id --reason "Second independent review"
+python src\manage_attempts.py history --attempt-id 1
+```
+
+Corrections append an audit record and preserve the original model prediction. The correctness status is computed from the reviewed ground truth and prediction, never by assuming that the target is ground truth or that a matching prediction proves the performed sign was correct. Canonical display labels do not change checkpoint vocabulary order or class indices: only metadata-confirmed aliases such as `WHATFOR1/2/3` are combined; labels with distinct sign identities keep their suffix as a visible variant.
 
 ---
 
@@ -387,9 +424,11 @@ python src/dataset.py --min-hand-ratio 0.2
 python src/train.py --kind gru  --seed 0
 python src/train.py --kind lstm --seed 0
 
-# 5. demo
-python src/demo.py --ckpt models\gru_seed0.pt --thr 0.5
+# 5. desktop application
+python src\demo.py --ckpt models\gru_seed3.pt
 ```
+
+The application opens in Demo mode. Use its top-right selector to switch to Testing. Both `src\demo.py` and `src\realtime.py` launch this same interface.
 
 Download links:
 - Holistic Landmarker model: https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task
@@ -412,7 +451,10 @@ asl_project/
 │  ├─ dataset.py         preprocessing, augmentation, Dataset
 │  ├─ model.py           BiGRU / BiLSTM classifier
 │  ├─ train.py           training + evaluation + reports
-│  └─ demo.py            webcam demo
+│  ├─ application.py     unified Demo / Testing desktop UI
+│  ├─ speech.py          asynchronous offline speech output
+│  ├─ realtime.py        compatibility entry point to the unified UI
+│  └─ demo.py            main application entry point
 ├─ data/
 │  ├─ raw/               ASL Citizen CSVs + videos
 │  ├─ landmarks/         per-video landmark arrays + _quality.csv

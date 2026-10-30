@@ -8,6 +8,12 @@ LANDMARKS = DATA / "landmarks"
 FEATURES = DATA / "features"
 MODELS = ROOT / "models"
 REPORTS = ROOT / "reports"
+SIGN_DEMOS = DATA / "sign_demos"
+SIGN_DEMO_MANIFEST = SIGN_DEMOS / "manifest.csv"
+SIGN_DEMO_VIDEOS = SIGN_DEMOS / "videos"
+MISSING_SIGN_DEMOS_REPORT = REPORTS / "missing_sign_demos.csv"
+RECOGNITION_ATTEMPTS_DB = DATA / "recognition_attempts.sqlite3"
+PREPROCESSING_VERSION = "landmarks-normalize-resample64-features590-v1"
 
 MODEL_TASK = MODELS / "holistic_landmarker.task"
 MODEL_URL = (

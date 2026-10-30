@@ -24,14 +24,21 @@ class State(Enum):
     COOLDOWN = auto()
 
 
+@dataclass(frozen=True)
+class SubtitleEntry:
+    canonical_label: str
+    original_model_label: str
+    class_index: Optional[int]
+
+
 @dataclass
 class SubtitleManager:
     # ---- Tuning params ----
     min_votes: int = 5           # ต้องเห็นคำเดียวกันอย่างน้อยกี่ครั้งต่อเนื่อง จึง CONFIRM
     vote_window: int = 10        # ขนาด sliding window สำหรับนับ votes
     conf_threshold: float = 0.45 # confidence ต่ำกว่านี้ = ไม่นับ
-    cooldown_sec: float = 0.8    # หลัง confirm รอกี่วินาทีก่อนรับคำใหม่
-    idle_frames: int = 8         # เฟรมที่ไม่เห็นมือ/confidence ต่ำ ก่อนออกจาก CANDIDATE
+    cooldown_sec: float = 0.8    # minimum time before the subtitle manager can re-arm
+    idle_frames: int = 8         # consecutive invalid updates required to re-arm
     max_subtitle_words: int = 50 # จำกัดความยาว subtitle
 
     # ---- Internal state ----
@@ -41,14 +48,16 @@ class SubtitleManager:
     _confirmed_word: str = field(default="", init=False)
     _confirmed_conf: float = field(default=0.0, init=False)
     _cooldown_start: float = field(default=0.0, init=False)
-    _subtitle_words: List[str] = field(default_factory=list, init=False)
-    _last_added: str = field(default="", init=False)
+    _subtitle_entries: List[SubtitleEntry] = field(default_factory=list, init=False)
 
     def update(
         self,
         word: Optional[str],
         conf: float,
         hands_present: bool,
+        *,
+        original_model_label: Optional[str] = None,
+        class_index: Optional[int] = None,
     ) -> Tuple[Optional[str], State]:
         """เรียกทุกครั้งที่มี prediction ใหม่
         
@@ -66,7 +75,14 @@ class SubtitleManager:
 
         # ---- COOLDOWN ----
         if self._state == State.COOLDOWN:
-            if time.time() - self._cooldown_start >= self.cooldown_sec:
+            if not valid:
+                self._idle_count += 1
+            else:
+                self._idle_count = 0
+            if (
+                time.monotonic() - self._cooldown_start >= self.cooldown_sec
+                and self._idle_count >= self.idle_frames
+            ):
                 self._state = State.IDLE
                 self._votes.clear()
                 self._idle_count = 0
@@ -90,7 +106,7 @@ class SubtitleManager:
 
         # นับ majority vote ใน window
         counter: dict[str, float] = {}
-        for w, c in self._votes:
+        for w, _ in self._votes:
             counter[w] = counter.get(w, 0) + 1
         best_word = max(counter, key=lambda k: counter[k])
         best_count = counter[best_word]
@@ -111,30 +127,45 @@ class SubtitleManager:
                 avg_conf = sum(c for w, c in self._votes if w == best_word) / best_count
                 self._confirmed_word = best_word
                 self._confirmed_conf = avg_conf
-                self._add_word(best_word)
+                self._add_word(
+                    best_word,
+                    original_model_label or best_word,
+                    class_index,
+                )
                 newly_confirmed = best_word
                 self._state = State.CONFIRMED
-                self._cooldown_start = time.time()
+                self._cooldown_start = time.monotonic()
                 self._votes.clear()
                 # ย้ายไป COOLDOWN ทันที
                 self._state = State.COOLDOWN
 
         return newly_confirmed, self._state
 
-    def _add_word(self, word: str) -> None:
-        self._subtitle_words.append(word)
-        if len(self._subtitle_words) > self.max_subtitle_words:
-            self._subtitle_words.pop(0)
-        self._last_added = word
+    def _add_word(
+        self, word: str, original_model_label: str, class_index: Optional[int]
+    ) -> None:
+        self._subtitle_entries.append(
+            SubtitleEntry(word, original_model_label, class_index)
+        )
+        if len(self._subtitle_entries) > self.max_subtitle_words:
+            self._subtitle_entries.pop(0)
 
     # ---- Public accessors ----
     @property
     def subtitle(self) -> str:
-        return " ".join(self._subtitle_words)
+        return " ".join(entry.canonical_label for entry in self._subtitle_entries)
 
     @property
     def word_list(self) -> List[str]:
-        return list(self._subtitle_words)
+        return [entry.canonical_label for entry in self._subtitle_entries]
+
+    @property
+    def entries(self) -> List[SubtitleEntry]:
+        return list(self._subtitle_entries)
+
+    @property
+    def idle_count(self) -> int:
+        return self._idle_count
 
     @property
     def state(self) -> State:
@@ -163,9 +194,8 @@ class SubtitleManager:
 
     def clear(self) -> None:
         """ล้าง subtitle และ reset state"""
-        self._subtitle_words.clear()
+        self._subtitle_entries.clear()
         self._votes.clear()
         self._state = State.IDLE
         self._idle_count = 0
         self._confirmed_word = ""
-        self._last_added = ""
